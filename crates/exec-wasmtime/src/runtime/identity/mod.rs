@@ -3,7 +3,7 @@
 //! Functionality for establishing keep identity.
 
 mod pki;
-mod platform;
+pub mod platform;
 
 use pki::PrivateKeyInfoExt;
 use platform::{Platform, Technology};

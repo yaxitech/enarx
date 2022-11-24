@@ -6,6 +6,7 @@ mod identity;
 mod io;
 mod net;
 
+use self::identity::platform::Platform;
 use self::io::null::Null;
 use self::io::stdio_file;
 use self::net::{connect_file, listen_file};
@@ -16,8 +17,8 @@ use anyhow::{bail, Context};
 use enarx_config::{Config, File};
 use once_cell::sync::Lazy;
 use wasi_common::file::FileCaps;
-use wasi_common::WasiFile;
-use wasmtime::{AsContextMut, Engine, Linker, Module, Store, Trap, Val};
+use wasi_common::{WasiCtx, WasiFile};
+use wasmtime::{AsContextMut, Caller, Engine, Linker, Module, Store, Trap, Val};
 use wasmtime_wasi::stdio::{stderr, stdin, stdout};
 use wasmtime_wasi::{add_to_linker, WasiCtxBuilder};
 
@@ -31,6 +32,36 @@ static WASMTIME_CONFIG: Lazy<wasmtime::Config> = Lazy::new(|| {
     config.dynamic_memory_reserved_for_growth(16 * 1024 * 1024);
     config
 });
+
+mod wasmhelper {
+    use wasmtime::{Caller, Extern};
+
+    pub fn read<T>(caller: &mut Caller<'_, T>, ptr: i32, len: i32) -> Result<Vec<u8>, ()> {
+        let mem = match caller.get_export("memory") {
+            Some(Extern::Memory(mem)) => mem,
+            _ => return Err(()),
+        };
+        let data = mem
+            .data(&caller)
+            .get(ptr as u32 as usize..)
+            .and_then(|arr| arr.get(..len as u32 as usize));
+        data.map(|x| x.to_vec()).ok_or(())
+    }
+
+    pub fn write<T>(caller: &mut Caller<'_, T>, ptr: i32, len: i32, data: &[u8]) {
+        let mem = match caller.get_export("memory") {
+            Some(Extern::Memory(mem)) => mem,
+            _ => return,
+        };
+        if let Some(arr) = mem
+            .data_mut(caller)
+            .get_mut(ptr as u32 as usize..)
+            .and_then(|arr| arr.get_mut(..usize::min(data.len(), len as u32 as usize)))
+        {
+            arr.copy_from_slice(&data[..arr.len()]);
+        }
+    }
+}
 
 // The Enarx Wasm runtime
 pub struct Runtime;
@@ -61,6 +92,30 @@ impl Runtime {
 
         let mut linker = Linker::new(&engine);
         add_to_linker(&mut linker, |s| s).context("failed to setup linker and add WASI")?;
+
+        linker.func_wrap(
+            "host",
+            "attestation_report",
+            |mut caller: Caller<'_, WasiCtx>, ptr: i32, len: i32, out_ptr: i32, out_len: i32| {
+                if len > 64 {
+                    return;
+                }
+
+                let platform = match Platform::get() {
+                    Ok(platform) => platform,
+                    Err(_) => return,
+                };
+                let nonce = match wasmhelper::read(&mut caller, ptr, len) {
+                    Ok(nonce) => nonce,
+                    Err(_) => return,
+                };
+                let report = match platform.attest(&nonce) {
+                    Ok(report) => report,
+                    Err(_) => return,
+                };
+                wasmhelper::write(&mut caller, out_ptr, out_len, &report);
+            },
+        )?;
 
         let mut wstore = Store::new(&engine, WasiCtxBuilder::new().build());
 
