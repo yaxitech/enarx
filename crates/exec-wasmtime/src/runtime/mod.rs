@@ -14,8 +14,9 @@ use self::net::{connect_file, listen_file};
 use super::{Package, Workload};
 
 use anyhow::{bail, Context};
-use enarx_config::{Config, File};
+use enarx_config::{Config, ConnectFile, File};
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicU32, Ordering};
 use wasi_common::file::FileCaps;
 use wasi_common::{WasiCtx, WasiFile};
 use wasmtime::{AsContextMut, Caller, Engine, Linker, Module, Store, Trap, Val};
@@ -117,6 +118,41 @@ impl Runtime {
             },
         )?;
 
+        linker.func_wrap("host", "connect", {
+            let prvkey = prvkey.clone();
+            let certs = certs.clone();
+            // Arbitrary large start so it doesn't interfere with Keep configuration 
+            let fd_counter = AtomicU32::new(128);
+            move |mut caller: Caller<'_, WasiCtx>, host_ptr: i32, host_len: i32, port: u32| {
+                let host = match wasmhelper::read(&mut caller, host_ptr, host_len).and_then(|x| {
+                    std::str::from_utf8(&x)
+                        .map(|x| x.to_string())
+                        .map_err(|_| ())
+                }) {
+                    Ok(host) => host,
+                    Err(_) => return 0,
+                };
+                let port = match port.try_into() {
+                    Ok(port) => port,
+                    Err(_) => return 0,
+                };
+                let file = ConnectFile::Tls {
+                    name: None,
+                    host,
+                    port,
+                };
+                let (file, caps) = match connect_file(&file, certs.clone(), &prvkey) {
+                    Ok(x) => x,
+                    Err(_) => return 0,
+                };
+                let fd = fd_counter.fetch_add(1, Ordering::SeqCst);
+                let ctx = caller.data_mut();
+                ctx.insert_file(fd, file, caps);
+
+                fd
+            }
+        })?;
+
         let mut wstore = Store::new(&engine, WasiCtxBuilder::new().build());
 
         let module =
@@ -142,6 +178,7 @@ impl Runtime {
                     .context("failed to setup connection stream")?,
             };
             let fd = fd.try_into().context("too many open files")?;
+            assert!(fd < 128);
             ctx.insert_file(fd, file, caps);
         }
         ctx.push_env("FD_COUNT", &names.len().to_string())
